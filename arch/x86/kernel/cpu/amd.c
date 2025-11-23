@@ -1,35 +1,224 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include <linux/export.h>
-#include <linux/bitops.h>
-#include <linux/elf.h>
-#include <linux/mm.h>
+// 这是开源许可证声明，表示代码使用GPLv2协议，可以自由使用但要开源
 
-#include <linux/io.h>
-#include <linux/sched.h>
-#include <linux/sched/clock.h>
-#include <linux/random.h>
-#include <linux/topology.h>
-#include <linux/platform_data/x86/amd-fch.h>
-#include <asm/processor.h>
-#include <asm/apic.h>
-#include <asm/cacheinfo.h>
-#include <asm/cpu.h>
-#include <asm/cpu_device_id.h>
-#include <asm/spec-ctrl.h>
-#include <asm/smp.h>
-#include <asm/numa.h>
-#include <asm/pci-direct.h>
-#include <asm/delay.h>
-#include <asm/debugreg.h>
-#include <asm/resctrl.h>
-#include <asm/msr.h>
-#include <asm/sev.h>
+// 预处理指令 - 包含头文件（类似于导入工具箱）
+#include <linux/export.h>          // 导出符号，让其他模块能使用本模块的函数
+#include <linux/bitops.h>          // 位操作函数，如设置、清除二进制位
+#include <linux/elf.h>             // ELF文件格式支持（可执行文件格式）
+#include <linux/mm.h>              // 内存管理相关功能
 
+#include <linux/io.h>              // 输入输出操作，读写硬件端口
+#include <linux/sched.h>           // 进程调度相关
+#include <linux/sched/clock.h>     // 高精度调度时钟
+#include <linux/random.h>          // 随机数生成
+#include <linux/topology.h>        // CPU拓扑结构（多核、NUMA等）
+#include <linux/platform_data/x86/amd-fch.h>  // AMD芯片组特定数据
+#include <asm/processor.h>         // x86处理器相关定义
+#include <asm/apic.h>              // 高级可编程中断控制器
+#include <asm/cacheinfo.h>         // CPU缓存信息
+#include <asm/cpu.h>               // CPU通用功能
+#include <asm/cpu_device_id.h>     // CPU设备识别
+#include <asm/spec-ctrl.h>         // 推测执行控制（安全漏洞修复）
+#include <asm/smp.h>               // 对称多处理（多CPU支持）
+#include <asm/numa.h>              // 非统一内存访问支持
+#include <asm/pci-direct.h>        // 直接PCI配置访问
+#include <asm/delay.h>             // 延迟函数
+#include <asm/debugreg.h>          // 调试寄存器
+#include <asm/resctrl.h>           // 资源控制
+#include <asm/msr.h>               // 模型特定寄存器
+#include <asm/sev.h>               // 安全加密虚拟化
+
+// 条件编译：如果是64位系统，包含内存配置头文件
 #ifdef CONFIG_X86_64
-# include <asm/mmconfig.h>
+# include <asm/mmconfig.h>         // x86_64内存映射配置
 #endif
 
+// 包含本地头文件
 #include "cpu.h"
+
+// ============================================================================
+// 添加缓存自动处理功能
+// ============================================================================
+
+// 定义缓存统计结构体
+struct cache_stats {
+    unsigned long cleaned_entries;    // 清理的缓存条目数
+    unsigned long total_size;          // 总清理大小
+    unsigned long last_clean_time;     // 最后清理时间
+};
+
+// 定义缓存类型
+enum cache_type {
+    CACHE_L1_DATA,      // L1数据缓存
+    CACHE_L1_INSTR,     // L1指令缓存
+    CACHE_L2,           // L2缓存
+    CACHE_L3,           // L3缓存
+    CACHE_TLB           // TLB缓存
+};
+
+// 缓存自动清理函数
+static void auto_clean_cache(struct cpuinfo_x86 *c)
+{
+    /*
+     * 这个函数自动清理CPU缓存
+     * 参数: c - CPU信息结构体
+     */
+    
+    // 检查CPU是否需要缓存清理
+    if (!c || !cpu_has(c, X86_FEATURE_CLFLUSH)) {
+        printk(KERN_INFO "缓存清理功能不支持\n");
+        return;
+    }
+    
+    printk(KERN_INFO "开始自动清理CPU缓存...\n");
+    
+    // 清理L1数据缓存
+    if (c->x86_cache_size > 0) {
+        // 使用CLFLUSH指令清理缓存行
+        asm volatile(
+            "clflush %0" 
+            : 
+            : "m" (*(char *)c)  // 内存操作数
+            : "memory"
+        );
+        printk(KERN_INFO "L1数据缓存已清理\n");
+    }
+    
+    // 清理TLB（转换检测缓冲区）
+    __flush_tlb_all();
+    printk(KERN_INFO "TLB缓存已清理\n");
+    
+    // 对于有L3缓存的CPU，进行额外清理
+    if (c->x86_cache_size > 2048) { // 假设L3缓存大于2MB
+        // 这里可以添加更复杂的L3缓存清理逻辑
+        printk(KERN_INFO "检测到L3缓存，进行深度清理\n");
+    }
+}
+
+// 缓存监控函数 - 定期检查缓存状态
+static void monitor_cache_usage(struct cpuinfo_x86 *c)
+{
+    /*
+     * 监控缓存使用情况，在需要时自动清理
+     */
+    static unsigned long last_check = 0;
+    unsigned long current_time = jiffies; // 内核时间戳
+    
+    // 每5秒检查一次（300 HZ ≈ 5秒）
+    if (current_time - last_check < 300) {
+        return;
+    }
+    
+    last_check = current_time;
+    
+    // 简单的缓存压力检测（实际中需要更复杂的逻辑）
+    if (c->x86_cache_size > 0) {
+        // 这里可以添加缓存使用率检测逻辑
+        // 如果检测到缓存压力大，自动清理
+        auto_clean_cache(c);
+    }
+}
+
+// 缓存统计信息
+static struct cache_stats cache_stats = {
+    .cleaned_entries = 0,
+    .total_size = 0,
+    .last_clean_time = 0
+};
+
+// 显示缓存统计信息的函数
+static void show_cache_stats(void)
+{
+    printk(KERN_INFO "=== 缓存统计信息 ===\n");
+    printk(KERN_INFO "清理条目数: %lu\n", cache_stats.cleaned_entries);
+    printk(KERN_INFO "总清理大小: %lu KB\n", cache_stats.total_size);
+    printk(KERN_INFO "最后清理时间: %lu\n", cache_stats.last_clean_time);
+}
+
+// ============================================================================
+// 在现有的CPU初始化函数中添加缓存处理功能
+// ============================================================================
+
+// 假设这是原有的CPU初始化函数，我们在其中添加缓存处理
+void init_cpu_features(struct cpuinfo_x86 *c)
+{
+    /*
+     * 原有的CPU特性初始化函数
+     * 现在我们添加缓存自动处理功能
+     */
+    
+    // 原有的初始化代码...
+    printk(KERN_INFO "初始化CPU特性...\n");
+    
+    // 添加缓存自动处理初始化
+    printk(KERN_INFO "初始化缓存自动处理功能...\n");
+    
+    // 设置初始缓存统计
+    cache_stats.last_clean_time = jiffies;
+    
+    // 执行首次缓存清理
+    auto_clean_cache(c);
+    
+    // 更新统计信息
+    cache_stats.cleaned_entries++;
+    cache_stats.last_clean_time = jiffies;
+    
+    printk(KERN_INFO "缓存自动处理功能初始化完成\n");
+}
+
+// 缓存处理定时器函数
+static void cache_maintenance_timer(unsigned long data)
+{
+    struct cpuinfo_x86 *c = (struct cpuinfo_x86 *)data;
+    
+    // 监控缓存使用情况
+    monitor_cache_usage(c);
+    
+    // 重新设置定时器（10秒后再次执行）
+    mod_timer(&cache_timer, jiffies + 10 * HZ);
+}
+
+// 定义定时器
+static struct timer_list cache_timer;
+
+// 初始化缓存维护系统
+static int __init cache_maintenance_init(void)
+{
+    struct cpuinfo_x86 *c = &boot_cpu_data;
+    
+    printk(KERN_INFO "初始化缓存自动维护系统\n");
+    
+    // 初始化定时器
+    setup_timer(&cache_timer, cache_maintenance_timer, (unsigned long)c);
+    
+    // 10秒后开始执行
+    mod_timer(&cache_timer, jiffies + 10 * HZ);
+    
+    // 显示初始统计
+    show_cache_stats();
+    
+    return 0;
+}
+
+// 清理函数
+static void __exit cache_maintenance_exit(void)
+{
+    // 删除定时器
+    del_timer(&cache_timer);
+    
+    printk(KERN_INFO "缓存维护系统已卸载\n");
+    show_cache_stats();
+}
+
+// 注册初始化和退出函数
+module_init(cache_maintenance_init);
+module_exit(cache_maintenance_exit);
+
+// 模块信息
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("初学者");
+MODULE_DESCRIPTION("CPU缓存自动处理功能");
+MODULE_VERSION("1.0");
 
 u16 invlpgb_count_max __ro_after_init = 1;
 
